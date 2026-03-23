@@ -42,7 +42,7 @@ Agent with Tools:
 ### How This Agent Works
 
 This is an **agentic system** that combines:
-1. **Agent Intelligence**: GPT-5-Nano reasons about security events and patterns
+1. **Agent Intelligence**: GPT-model reasons about security events and patterns
 2. **Tools**: 4 specialized functions for parsing, searching, analyzing, and retrieving logs
 3. **RAG**: FAISS vector store for semantic search across log chunks
 4. **Regex Pattern Analysis**: Structured analysis on raw log text for statistical insights
