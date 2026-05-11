@@ -26,6 +26,84 @@ LOG_DIR.mkdir(exist_ok=True)
 # Maximum characters to return from any tool to avoid token limits
 MAX_TOOL_OUTPUT_CHARS = 15000
 
+
+class PIIMasker:
+    """Replaces IPs, hostnames, and usernames with opaque tokens before text reaches the LLM,
+    and restores the real values after the LLM produces its answer."""
+
+    IP_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+    RHOST_RE = re.compile(r'rhost=(\S+)')
+
+    def __init__(self):
+        self._ip_map: Dict[str, str] = {}
+        self._host_map: Dict[str, str] = {}
+        self._user_map: Dict[str, str] = {}
+        self._token_map: Dict[str, str] = {}
+        self._ip_count = 0
+        self._host_count = 0
+        self._user_count = 0
+
+    def _ip_token(self, ip: str) -> str:
+        if ip not in self._ip_map:
+            self._ip_count += 1
+            tok = f"[IP_{self._ip_count}]"
+            self._ip_map[ip] = tok
+            self._token_map[tok] = ip
+        return self._ip_map[ip]
+
+    def register_hostname(self, hostname: str):
+        if hostname and hostname not in self._host_map and hostname not in self._ip_map:
+            self._host_count += 1
+            tok = f"[HOST_{self._host_count}]"
+            self._host_map[hostname] = tok
+            self._token_map[tok] = hostname
+
+    def register_username(self, username: str):
+        if username and username not in self._user_map:
+            self._user_count += 1
+            tok = f"[USER_{self._user_count}]"
+            self._user_map[username] = tok
+            self._token_map[tok] = username
+
+    def scan_logs_for_users(self, raw_logs: Dict[str, str]):
+        """Pre-register all usernames and non-IP hostnames found in raw logs."""
+        user_patterns = [re.compile(r'user=(\S+)'), re.compile(r'for user (\S+)')]
+        for content in raw_logs.values():
+            for line in content.splitlines():
+                for pat in user_patterns:
+                    m = pat.search(line)
+                    if m:
+                        user = m.group(1).strip('(),:;')
+                        if user:
+                            self.register_username(user)
+                m = self.RHOST_RE.search(line)
+                if m:
+                    host = m.group(1).strip()
+                    if host and not self.IP_RE.fullmatch(host):
+                        self.register_hostname(host)
+
+    def mask(self, text: str) -> str:
+        """Replace all IPs, hostnames, and known usernames with tokens."""
+        text = self.IP_RE.sub(lambda m: self._ip_token(m.group(0)), text)
+        for real in sorted(self._host_map, key=len, reverse=True):
+            text = text.replace(real, self._host_map[real])
+        for real in sorted(self._user_map, key=len, reverse=True):
+            text = re.sub(r'\b' + re.escape(real) + r'\b', self._user_map[real], text)
+        return text
+
+    def unmask(self, text: str) -> str:
+        """Restore all tokens to their original values.
+
+        Handles both the original bracketed form [IP_1] and the bracket-stripped
+        form IP_1 that LLMs sometimes produce in generated text.
+        """
+        for tok in sorted(self._token_map, key=len, reverse=True):
+            real = self._token_map[tok]
+            text = text.replace(tok, real)
+            bare = tok.strip('[]')
+            text = re.sub(r'\b' + re.escape(bare) + r'\b', real, text)
+        return text
+
 # Maximum number of lines to index in vector store (keeps embeddings manageable)
 MAX_LINES_FOR_VECTORSTORE = 10000
 
@@ -43,13 +121,15 @@ def _truncate_output(text: str, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> str:
 class LogAnalyzer:
     """Log Analyzer Agent that reads system/security log files and provides analytics."""
 
-    def __init__(self, model_name: str = "gpt-5-nano"):
+    def __init__(self, model_name: str = "gpt-5-nano", mask_pii: bool = False):
         """Initialize the Log Analyzer."""
         self.model_name = model_name
+        self.mask_pii = mask_pii
+        self.masker = PIIMasker() if mask_pii else None
         self.llm = ChatOpenAI(model=model_name, temperature=0)
         self.chat_history: List[Dict[str, str]] = []
         self.log_dir = LOG_DIR
-        self.embeddings = OpenAIEmbeddings()
+        self.embeddings = None if mask_pii else OpenAIEmbeddings()
         self.vector_store = None
         self.all_documents = []
         self.raw_logs = {}
@@ -95,28 +175,31 @@ class LogAnalyzer:
                 line_count = len(lines)
                 self.log_line_counts[log_file.name] = line_count
 
-                # Sample lines for vector store if file is too large
-                if line_count > MAX_LINES_FOR_VECTORSTORE:
-                    step = max(1, line_count // MAX_LINES_FOR_VECTORSTORE)
-                    sampled_lines = lines[::step][:MAX_LINES_FOR_VECTORSTORE]
-                    sampled_note = f" (sampled {len(sampled_lines)} of {line_count} lines for search)"
-                else:
-                    sampled_lines = lines
-                    sampled_note = ""
+                if not self.mask_pii:
+                    # Sample lines for vector store if file is too large
+                    if line_count > MAX_LINES_FOR_VECTORSTORE:
+                        step = max(1, line_count // MAX_LINES_FOR_VECTORSTORE)
+                        sampled_lines = lines[::step][:MAX_LINES_FOR_VECTORSTORE]
+                        sampled_note = f" (sampled {len(sampled_lines)} of {line_count} lines for search)"
+                    else:
+                        sampled_lines = lines
+                        sampled_note = ""
 
-                # Create documents from chunks
-                for i in range(0, len(sampled_lines), CHUNK_SIZE):
-                    chunk_lines = sampled_lines[i:i + CHUNK_SIZE]
-                    chunk_text = "\n".join(chunk_lines)
-                    doc = Document(
-                        page_content=chunk_text,
-                        metadata={
-                            "source": str(log_file),
-                            "file_name": log_file.name,
-                            "chunk_index": i // CHUNK_SIZE,
-                        }
-                    )
-                    self.all_documents.append(doc)
+                    # Create documents from chunks
+                    for i in range(0, len(sampled_lines), CHUNK_SIZE):
+                        chunk_lines = sampled_lines[i:i + CHUNK_SIZE]
+                        chunk_text = "\n".join(chunk_lines)
+                        doc = Document(
+                            page_content=chunk_text,
+                            metadata={
+                                "source": str(log_file),
+                                "file_name": log_file.name,
+                                "chunk_index": i // CHUNK_SIZE,
+                            }
+                        )
+                        self.all_documents.append(doc)
+                else:
+                    sampled_note = " (embeddings skipped — mask_pii mode)"
 
                 file_info.append(
                     f"- {log_file.name}: {line_count} lines, {len(content)} bytes{sampled_note}"
@@ -126,7 +209,7 @@ class LogAnalyzer:
                 file_info.append(f"- {log_file.name}: Error loading - {str(e)}")
 
         # Create vector store in batches
-        if self.all_documents:
+        if not self.mask_pii and self.all_documents:
             batch_size = 200
             self.vector_store = None
             for i in range(0, len(self.all_documents), batch_size):
@@ -136,6 +219,8 @@ class LogAnalyzer:
                 else:
                     batch_store = FAISS.from_documents(batch, self.embeddings)
                     self.vector_store.merge_from(batch_store)
+        elif self.mask_pii:
+            self.masker.scan_logs_for_users(self.raw_logs)
 
         self._logs_parsed = True
 
@@ -149,6 +234,8 @@ class LogAnalyzer:
         Supports single or comma-separated queries.
         Returns relevant log excerpts.
         """
+        if self.mask_pii:
+            return "Semantic search is unavailable in mask_pii mode. Use analyze_log_patterns instead."
         if self.vector_store is None:
             self._parse_log_files()
             if self.vector_store is None:
@@ -401,27 +488,35 @@ class LogAnalyzer:
         def parse_no_input() -> str:
             return self._parse_log_files()
 
+        def _masked(func):
+            """Wrap a tool function to mask PII in its output when mask_pii is enabled."""
+            if not self.mask_pii:
+                return func
+            def wrapper(*args, **kwargs):
+                return self.masker.mask(func(*args, **kwargs))
+            return wrapper
+
         tools = [
             StructuredTool.from_function(
-                func=parse_no_input,
+                func=_masked(parse_no_input),
                 name="parse_log_files",
                 description="Parse and index all log files. Call this ONCE at the start. Takes no input.",
                 args_schema=ParseInput
             ),
             StructuredTool.from_function(
-                func=self._search_logs,
+                func=_masked(self._search_logs),
                 name="search_logs",
                 description="Semantic search through log files. Input: search query string. Supports comma-separated multi-queries.",
                 args_schema=SearchInput
             ),
             StructuredTool.from_function(
-                func=self._analyze_log_patterns,
+                func=_masked(self._analyze_log_patterns),
                 name="analyze_log_patterns",
                 description="Statistical pattern analysis. Input: ONE analysis type (failed_logins, successful_logins, top_ips, top_services, error_summary, brute_force, ftp_connections, time_distribution, exploit_attempts, user_activity). Use 'all' ONLY when user asks for complete overview.",
                 args_schema=AnalyzeInput
             ),
             StructuredTool.from_function(
-                func=self._get_raw_logs,
+                func=_masked(self._get_raw_logs),
                 name="get_raw_logs",
                 description="Get raw log lines from a SPECIFIC file. Input: exact file name (required). Shows first/last 30 lines.",
                 args_schema=RawLogInput
@@ -495,6 +590,8 @@ Do NOT suggest further steps at the end. Give a complete answer."""),
             })
 
             answer = response["output"]
+            if self.mask_pii:
+                answer = self.masker.unmask(answer)
             self.chat_history.append({
                 "question": question,
                 "answer": answer
@@ -515,6 +612,13 @@ Do NOT suggest further steps at the end. Give a complete answer."""),
 
 def main():
     """Main function to run the Log Analyzer in interactive mode."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Security Log Analyzer Agent")
+    parser.add_argument(
+        "--mask-pii", action="store_true",
+        help="Replace IPs and usernames with tokens before sending to OpenAI, then restore them in the output"
+    )
+    args = parser.parse_args()
 
     print("=" * 80)
     print("SECURITY LOG ANALYZER")
@@ -534,7 +638,9 @@ def main():
         return
 
     try:
-        analyzer = LogAnalyzer(model_name="gpt-5-nano")
+        analyzer = LogAnalyzer(model_name="gpt-5-nano", mask_pii=args.mask_pii)
+        if args.mask_pii:
+            print("✓ PII masking enabled — IPs and usernames will not be sent to OpenAI")
         print("\n✓ Log Analyzer initialized successfully!\n")
     except Exception as e:
         print(f"\nERROR: Failed to initialize analyzer: {e}")

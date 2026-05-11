@@ -80,10 +80,13 @@ Place your log files (`.log`, `.txt`, `.csv`) in the `log_files/` directory (cre
 python log_agent.py
 ```
 
+
 ### Commands
 - **Ask a question**: Simply type your question
 - **`clear`**: Clear the chat history
 - **`quit`** or **`exit`**: Exit the agent
+
+
 
 ## How It Works
 
@@ -221,6 +224,30 @@ log-agent/
 ├── .env                    # Environment variables (create this)
 └── log_files/              # Directory for log files (auto-created)
 ```
+
+## Privacy: PII Masking (`--mask-pii`)
+
+By default, the agent sends log excerpts and extracted values (IPs, usernames, hostnames) to the OpenAI API as part of tool outputs and search results. If your logs contain sensitive data, use the `--mask-pii` flag to prevent any PII from leaving your machine.
+
+To run with PII masking enabled (no sensitive data sent to LLM):
+
+```bash
+python log_agent.py --mask-pii
+```
+
+### Example
+
+```
+$ python log_agent.py --mask-pii
+
+✓ PII masking enabled — IPs and usernames will not be sent to OpenAI
+✓ Log Analyzer initialized successfully!
+
+You: Are there any attacks in the logs?
+```
+
+The agent will analyze as earlier. The answer you receive will contain the real IPs, hostnames, and usernames — restored after the LLM produces its response.
+
 
 ## Troubleshooting
 
