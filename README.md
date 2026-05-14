@@ -210,7 +210,7 @@ Agent will:
 
 ## Requirements
 
-- Python 3.12+
+- Python <= 3.12 
 - OpenAI API key (gpt-5-nano model)
 - Log files in `.log`, `.txt`, or `.csv` format
 
