@@ -126,7 +126,7 @@ class LogAnalyzer:
         self.model_name = model_name
         self.mask_pii = mask_pii
         self.masker = PIIMasker() if mask_pii else None
-        self.llm = ChatOpenAI(model=model_name, temperature=0)
+        self.llm = ChatOpenAI(model=model_name)
         self.chat_history: List[Dict[str, str]] = []
         self.log_dir = LOG_DIR
         self.embeddings = None if mask_pii else OpenAIEmbeddings()
