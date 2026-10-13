@@ -19,6 +19,14 @@ from langchain_core.pydantic_v1 import BaseModel, Field
 # Load environment variables
 load_dotenv()
 
+# Use the OS certificate store for HTTPS so TLS-inspecting proxies (e.g. Zscaler) are trusted.
+# truststore needs Python 3.10+; without it, the default certifi bundle is used.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 # Create log files directory
 LOG_DIR = Path("log_files")
 LOG_DIR.mkdir(exist_ok=True)

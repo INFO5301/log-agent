@@ -7,3 +7,4 @@ python-dotenv
 openai
 faiss-cpu
 pypdf
+truststore; python_version >= "3.10"
